@@ -1,0 +1,22 @@
+{
+  "platforms_config": [
+    {
+      "name": "Crunchyroll",
+      "status": "active",
+      "type": "anime_focus",
+      "base_url": "https://www.crunchyroll.com/pt-br/search?q="
+    },
+    {
+      "name": "Netflix",
+      "status": "active",
+      "type": "generalist",
+      "base_url": "https://www.netflix.com/search?q="
+    },
+    {
+      "name": "Prime Video",
+      "status": "active",
+      "type": "generalist",
+      "base_url": "https://www.primevideo.com/search?phrase="
+    }
+  ]
+}
