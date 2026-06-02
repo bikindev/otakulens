@@ -1,0 +1,16 @@
+# Ambientes Virtuais
+.venv/
+venv/
+ENV/
+ENV_DIR/
+
+# Banco de Dados Vetorial Local
+**/chroma_db/
+*.sqlite3
+
+# Caches do Python
+**/__pycache__/
+*.pyc
+
+# Configurações do VS Code
+.vscode/
