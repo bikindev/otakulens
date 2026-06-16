@@ -28,7 +28,7 @@ if st.button("Buscar Recomendações ✨", use_container_width=True):
         with st.spinner("Processando..."):
             try:
                 payload = {"prompt": user_input}
-                response = requests.post(BACKEND_URL, json=payload, timeout=190.0)
+                response = requests.post(BACKEND_URL, json=payload, timeout=310.0)
                 
                 if response.status_code == 200:
                     data = response.json()
