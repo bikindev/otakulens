@@ -1,10 +1,7 @@
 # app/llm_chain.py
-import re
 import asyncio
 import httpx
 from langchain_community.llms import Ollama
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.output_parsers import StrOutputParser
 
 CATALOG_SERVICE_URL = "http://127.0.0.1:8001/catalog/search-semantic"
 MCP_DIRECT_TOOL_URL = "http://127.0.0.1:8002/tools/search"
@@ -16,7 +13,7 @@ llm = Ollama(
     base_url="http://127.0.0.1:11434",
     model="phi3:mini",
     temperature=0.1,
-    num_predict=512,
+    num_predict=400,
 )
 
 MAX_CONTEXTO_CHARS = 800
@@ -31,20 +28,15 @@ async def consultar_catalogo_vetorial(prompt_usuario: str, limite: int = 2) -> l
             response = await client.post(CATALOG_SERVICE_URL, json=payload, timeout=10.0)
             if response.status_code == 200:
                 return response.json()
-            return []
+        return []
     except Exception as e:
         print(f"[CATALOG ERROR] {e}")
         return []
 
 # ---------------------------------------------------------------------------
-# MCP — busca links via rota HTTP direta (sem SSE)
-# Retorna lista de dicts: [{"anime":..., "plataforma":..., "url_direta":...}]
+# MCP — busca links via rota HTTP direta
 # ---------------------------------------------------------------------------
 async def buscar_links_mcp(titulo_anime: str) -> list:
-    """
-    Chama /tools/search e retorna a lista de links brutos.
-    O LLM NÃO verá essas URLs — elas são injetadas pelo Python depois da geração.
-    """
     payload = {"anime_title": titulo_anime}
     try:
         async with httpx.AsyncClient() as client:
@@ -63,43 +55,46 @@ async def buscar_links_mcp(titulo_anime: str) -> list:
         return []
 
 # ---------------------------------------------------------------------------
-# Pipeline de enriquecimento
+# Geração de sinopse — 1 chamada por anime (resolve o bug de injeção cruzada)
 # ---------------------------------------------------------------------------
-async def pipeline_enriquecimento_mcp(animes_contexto: list):
+async def gerar_sinopse_anime(titulo: str, ano: int, trecho_contexto: str, pergunta: str) -> str:
     """
-    Retorna:
-      - contexto_str : texto injetado no prompt (SEM URLs — só título, sinopse, plataformas)
-      - links_map    : dict { titulo -> lista de links } para injeção pós-geração
+    Pede ao LLM APENAS a sinopse de UM anime específico.
+    Prompt minimalista para evitar vazamento de instruções pelo phi3:mini.
     """
-    tarefas_mcp = [buscar_links_mcp(anime["titulo"]) for anime in animes_contexto]
-    resultados_mcp = await asyncio.gather(*tarefas_mcp)
+    trecho = trecho_contexto
+    if len(trecho) > MAX_CONTEXTO_CHARS:
+        trecho = trecho[:MAX_CONTEXTO_CHARS] + "..."
 
-    contexto_str = ""
-    links_map = {}
+    # Prompt simples em formato de instrução direta (sem ChatPromptTemplate)
+    # O phi3:mini lida melhor com uma única string do que com roles system/user separados
+    prompt_direto = (
+        f"Resuma em português brasileiro, em 2 a 3 frases, o anime '{titulo}' "
+        f"com base nestas informações: {trecho}\n\n"
+        f"Escreva APENAS o resumo, sem título, sem listas, sem explicações extras."
+    )
 
-    for anime, links in zip(animes_contexto, resultados_mcp):
-        titulo = anime["titulo"]
-        plataformas = ", ".join(anime["plataformas"])
-        trecho = anime["trecho_contexto"]
-        if len(trecho) > MAX_CONTEXTO_CHARS:
-            trecho = trecho[:MAX_CONTEXTO_CHARS] + "..."
-
-        # Contexto para o LLM — sem nenhuma URL
-        contexto_str += "\n---\n"
-        contexto_str += f"Título: {titulo} ({anime['ano']})\n"
-        contexto_str += f"Plataformas disponíveis: {plataformas}\n"
-        contexto_str += f"Informações: {trecho}\n"
-
-        # Links guardados separadamente para injeção posterior
-        links_map[titulo] = links
-
-    return contexto_str, links_map
+    try:
+        sinopse = await llm.ainvoke(prompt_direto)
+        # Garante que só o primeiro parágrafo seja usado (corta qualquer vazamento)
+        linhas = [l for l in sinopse.strip().splitlines() if l.strip()]
+        # Descarta linhas que parecem ser instruções vazadas (palavras-chave reveladoras)
+        linhas_limpas = [
+            l for l in linhas
+            if not any(kw in l.lower() for kw in [
+                "system:", "anime:", "informações:", "respon", "escreva",
+                "sinopse:", "onde assistir", "pt-br", "português"
+            ])
+        ]
+        return " ".join(linhas_limpas).strip() if linhas_limpas else " ".join(linhas[:3]).strip()
+    except Exception as e:
+        print(f"[LLM SINOPSE ERROR] {titulo}: {e}")
+        return "Sinopse temporariamente indisponível."
 
 # ---------------------------------------------------------------------------
-# Injeção de links pós-geração
+# Montagem da seção de links
 # ---------------------------------------------------------------------------
 def _formatar_secao_links(links: list) -> str:
-    """Monta a seção 'Onde assistir' com os links reais do MCP."""
     if not links:
         return "**Onde assistir:** Links indisponíveis no momento.\n"
     linhas = "**Onde assistir:**\n"
@@ -107,54 +102,18 @@ def _formatar_secao_links(links: list) -> str:
         linhas += f"- Na {item['plataforma']}: {item['url_direta']}\n"
     return linhas
 
-def injetar_links_na_resposta(texto_llm: str, links_map: dict) -> str:
-    """
-    Estratégia: remove qualquer bloco '**Onde assistir:**...' que o LLM tenha
-    gerado (com ou sem URL real) e substitui pelo conteúdo exato do MCP.
-
-    Para cada título em links_map, localiza o cabeçalho ### do anime na resposta
-    e injeta a seção de links logo após o bloco de Sinopse.
-    """
-    resultado = texto_llm
-
-    for titulo, links in links_map.items():
-        secao_links = _formatar_secao_links(links)
-
-        # Remove qualquer "**Onde assistir:**" existente (com conteúdo até o próximo ### ou fim)
-        resultado = re.sub(
-            r'\*\*Onde assistir:\*\*.*?(?=\n###|\Z)',
-            '',
-            resultado,
-            flags=re.DOTALL
-        )
-
-        # Localiza o fim do bloco **Sinopse:** deste anime e injeta os links logo depois
-        # Busca pelo padrão: **Sinopse:** [qualquer coisa] seguido de linha em branco
-        padrao_sinopse = r'(\*\*Sinopse:\*\*[^\n]*(?:\n(?!\n###|\n\*\*)[^\n]*)*)'
-        match = re.search(padrao_sinopse, resultado)
-        if match:
-            pos_fim_sinopse = match.end()
-            resultado = (
-                resultado[:pos_fim_sinopse]
-                + "\n\n"
-                + secao_links
-                + resultado[pos_fim_sinopse:]
-            )
-
-    return resultado.strip()
-
 # ---------------------------------------------------------------------------
 # Pipeline principal
 # ---------------------------------------------------------------------------
 async def gerar_recomendacao_rag(prompt_usuario: str) -> str:
     """
-    Pipeline RAG + MCP com links injetados pelo Python (não pelo LLM).
+    Pipeline RAG + MCP com resposta montada inteiramente pelo Python.
 
-    Fluxo:
-      1. Busca animes no catálogo vetorial
-      2. Busca links no MCP (paralelo) — armazena em links_map, NÃO passa ao LLM
-      3. LLM gera apenas título + sinopse
-      4. Python injeta os links reais na resposta final
+    Fluxo por anime:
+      1. Busca catálogo vetorial
+      2. Busca links MCP (paralelo entre animes)
+      3. Gera sinopse via LLM (paralelo entre animes, 1 chamada por anime)
+      4. Python monta o bloco final: ### título + sinopse + links reais
     """
 
     # 1. RETRIEVAL
@@ -162,37 +121,33 @@ async def gerar_recomendacao_rag(prompt_usuario: str) -> str:
     if not animes_contexto:
         return "Desculpe, estou com dificuldades para acessar meu catálogo de animes no momento."
 
-    # 2. CONTEXT ENRICHMENT
-    contexto_str, links_map = await pipeline_enriquecimento_mcp(animes_contexto)
+    # 2 + 3. MCP e sinopses em paralelo para todos os animes
+    tarefas = []
+    for anime in animes_contexto:
+        tarefas.append(buscar_links_mcp(anime["titulo"]))
+        tarefas.append(gerar_sinopse_anime(
+            titulo=anime["titulo"],
+            ano=anime["ano"],
+            trecho_contexto=anime["trecho_contexto"],
+            pergunta=prompt_usuario,
+        ))
 
-    # 3. PROMPT — LLM gera apenas sinopse, sem ver URLs
-    prompt_template = ChatPromptTemplate.from_messages([
-        ("system", (
-            "Você é o OtakuLens, recomendador especialista em animes. "
-            "Responda EXCLUSIVAMENTE em Português do Brasil (pt-BR). "
-            "Traduza qualquer texto em inglês ou espanhol.\n\n"
+    resultados = await asyncio.gather(*tarefas)
 
-            "Para cada anime no CONTEXTO, escreva EXATAMENTE neste formato:\n\n"
-            "### [Nome do Anime] ([Ano])\n"
-            "**Sinopse:** [Escreva aqui um resumo em português, baseado nas Informações do contexto]\n\n"
+    # resultados vem intercalado: [links_0, sinopse_0, links_1, sinopse_1, ...]
+    blocos = []
+    for i, anime in enumerate(animes_contexto):
+        links   = resultados[i * 2]
+        sinopse = resultados[i * 2 + 1]
 
-            "NÃO escreva a seção 'Onde assistir'. Ela será adicionada automaticamente.\n"
-            "NÃO invente informações. Use apenas o que está no CONTEXTO.\n\n"
+        secao_links = _formatar_secao_links(links)
 
-            "CONTEXTO:\n{contexto}"
-        )),
-        ("user", "{pergunta}"),
-    ])
-
-    chain = prompt_template | llm | StrOutputParser()
-    try:
-        texto_llm = await chain.ainvoke(
-            {"contexto": contexto_str, "pergunta": prompt_usuario}
+        bloco = (
+            f"### {anime['titulo']} ({anime['ano']})\n"
+            f"**Sinopse:** {sinopse}\n\n"
+            f"{secao_links}"
         )
-    except Exception as e:
-        print(f"[LLM ERROR] {e}")
-        return "O modelo local demorou muito para responder. Tente novamente."
+        blocos.append(bloco)
 
-    # 4. INJEÇÃO DOS LINKS PELO PYTHON (100% confiável, sem depender do LLM)
-    resposta_final = injetar_links_na_resposta(texto_llm, links_map)
-    return resposta_final
+    # 4. MONTAGEM FINAL — Python controla 100% da estrutura
+    return "\n\n---\n\n".join(blocos)
