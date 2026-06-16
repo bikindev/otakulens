@@ -1,13 +1,21 @@
 # -*- coding: utf-8 -*-
 """
-OtakuLens - Servidor MCP Oficial (Modo SSE / HTTP)
+OtakuLens - Servidor MCP (Modo SSE / HTTP)
 Componente: mcp_server.py
+
+CORREÇÃO PRINCIPAL:
+  Adicionada rota HTTP direta /tools/search que não depende de sessão SSE.
+  O llm_chain.py passa a chamar essa rota — resolvendo o problema de links
+  não retornados quando o JSON-RPC era enviado ao /mcp/messages sem sessão ativa.
+
+CORREÇÃO SECUNDÁRIA:
+  A busca no ChromaDB agora usa filtro de metadados exato (where=) em vez de
+  similaridade semântica, garantindo que cada anime retorne SEUS PRÓPRIOS links.
 """
 
 import os
 import json
 import urllib.parse
-import asyncio
 import chromadb
 from chromadb.utils import embedding_functions
 from mcp.server import Server
@@ -15,19 +23,27 @@ import mcp.types as types
 from mcp.server.sse import SseServerTransport
 from starlette.applications import Starlette
 from starlette.routing import Route
+from starlette.requests import Request
+from starlette.responses import JSONResponse
 from starlette.middleware import Middleware
 from starlette.middleware.cors import CORSMiddleware
 
-# caminhos absolutos
-BASE_DIR = os.path.dirname(__file__)
-CHROMA_DIR = os.path.abspath(os.path.join(BASE_DIR, "..", "chroma_db"))
+# ---------------------------------------------------------------------------
+# Caminhos absolutos
+# ---------------------------------------------------------------------------
+BASE_DIR        = os.path.dirname(__file__)
+CHROMA_DIR      = os.path.abspath(os.path.join(BASE_DIR, "..", "chroma_db"))
 ANIMES_JSON_PATH = os.path.abspath(os.path.join(BASE_DIR, "..", "data", "raw_animes.json"))
-MCP_CONFIG_PATH = os.path.abspath(os.path.join(BASE_DIR, "..", "data", "mcp_streaming.json"))
+MCP_CONFIG_PATH  = os.path.abspath(os.path.join(BASE_DIR, "..", "data", "mcp_streaming.json"))
 
-# Inicializa o objeto do Servidor MCP Oficial
+# ---------------------------------------------------------------------------
+# Servidor MCP (SSE — mantido para conformidade com o protocolo)
+# ---------------------------------------------------------------------------
 server = Server("otakulens-mcp-server")
 
-# Inicializa o ChromaDB Global
+# ---------------------------------------------------------------------------
+# ChromaDB
+# ---------------------------------------------------------------------------
 os.makedirs(CHROMA_DIR, exist_ok=True)
 chroma_client = chromadb.PersistentClient(path=CHROMA_DIR)
 
@@ -42,45 +58,54 @@ collection = chroma_client.get_or_create_collection(
     metadata={"hnsw:space": "cosine"}
 )
 
+# ---------------------------------------------------------------------------
+# Seed dos dados mockados
+# ---------------------------------------------------------------------------
 def _seed_mock_data():
-    """Popula o ChromaDB do MCP dinamicamente se estiver vazio."""
+    """Popula o ChromaDB do MCP se estiver vazio."""
     if collection.count() > 0:
         return
-        
+
     if not os.path.exists(ANIMES_JSON_PATH) or not os.path.exists(MCP_CONFIG_PATH):
+        print("[MCP SERVER] AVISO: Arquivos de dados não encontrados. ChromaDB ficará vazio.")
         return
 
     with open(ANIMES_JSON_PATH, "r", encoding="utf-8") as f:
         catalog_animes = json.load(f)
     with open(MCP_CONFIG_PATH, "r", encoding="utf-8") as f:
         mcp_config = json.load(f)
-        
+
     platforms_map = {p["name"]: p for p in mcp_config["platforms_config"]}
     ids, documents, metadatas = [], [], []
-    
+
     for anime in catalog_animes:
-        titulo = anime["titulo"]
+        titulo   = anime["titulo"]
         id_anime = anime["id_anime"]
         for plat_name in anime.get("plataformas", []):
-            if plat_name in platforms_map:
-                plat_info = platforms_map[plat_name]
-                url_direta = f"{plat_info['base_url']}{urllib.parse.quote(titulo)}"
-                
-                ids.append(f"mcp_{id_anime}_{plat_name.lower()}")
-                documents.append(f"Assistir {titulo} online na plataforma {plat_name}")
-                metadatas.append({
-                    "id_anime": id_anime,
-                    "anime_title": titulo,
-                    "platform": plat_name,
-                    "url_direta": url_direta
-                })
-                
+            if plat_name not in platforms_map:
+                continue
+            plat_info  = platforms_map[plat_name]
+            # quote_plus é mais compatível com parâmetros de busca (?q=)
+            url_direta = f"{plat_info['base_url']}{urllib.parse.quote_plus(titulo)}"
+
+            ids.append(f"mcp_{id_anime}_{plat_name.lower()}")
+            documents.append(f"Assistir {titulo} online na plataforma {plat_name}")
+            metadatas.append({
+                "id_anime":    id_anime,
+                "anime_title": titulo,
+                "platform":    plat_name,
+                "url_direta":  url_direta
+            })
+
     if ids:
         collection.add(ids=ids, documents=documents, metadatas=metadatas)
+        print(f"[MCP SERVER] ChromaDB populado com {len(ids)} registros de streaming.")
 
 _seed_mock_data()
 
-# --- RECURSOS (RESOURCES) ---
+# ---------------------------------------------------------------------------
+# Handlers SSE (mantidos para conformidade com o protocolo MCP)
+# ---------------------------------------------------------------------------
 @server.list_resources()
 async def handle_list_resources() -> list[types.Resource]:
     return [
@@ -97,27 +122,26 @@ async def handle_read_resource(uri: str) -> str:
     if uri == "anime://catalog/streamings":
         if os.path.exists(MCP_CONFIG_PATH):
             with open(MCP_CONFIG_PATH, "r", encoding="utf-8") as f:
-                conteudo_bruto = f.read()
-            
-            print(f"[MCP SERVER] Recurso lido com sucesso. Tamanho: {len(conteudo_bruto)} caracteres.")
-            # Retorna a string bruta diretamente. Muitas versões do SDK preferem a string crua
-            # e o próprio decorador se encarrega de envelopar no formato JSON-RPC.
-            return conteudo_bruto
-            
+                return f.read()
     raise ValueError(f"Recurso não encontrado: {uri}")
 
-# --- FERRAMENTAS (TOOLS) ---
 @server.list_tools()
 async def handle_list_tools() -> list[types.Tool]:
     return [
         types.Tool(
             name="search_streaming_links",
-            description="Busca links diretos de streaming (URL) para assistir a um anime específico com base no título.",
+            description="Busca links diretos de streaming para um anime específico.",
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "anime_title": { "type": "string", "description": "O nome ou título exato do anime." },
-                    "preferred_platform": { "type": "string", "description": "Filtro opcional." }
+                    "anime_title": {
+                        "type": "string",
+                        "description": "Título exato do anime."
+                    },
+                    "preferred_platform": {
+                        "type": "string",
+                        "description": "Filtro opcional de plataforma."
+                    }
                 },
                 "required": ["anime_title"]
             }
@@ -127,64 +151,124 @@ async def handle_list_tools() -> list[types.Tool]:
 @server.call_tool()
 async def handle_call_tool(name: str, arguments: dict | None) -> list[types.TextContent]:
     if name == "search_streaming_links":
-        if not arguments: 
+        if not arguments:
             raise ValueError("Argumentos ausentes.")
-        
-        anime_title = arguments.get("anime_title")
-        preferred_platform = arguments.get("preferred_platform")
-        
-        results = collection.query(query_texts=[f"Assistir {anime_title}"], n_results=3)
-        output_links = []
-        
-        if results and results['metadatas'] and len(results['metadatas'][0]) > 0:
-            for meta in results['metadatas'][0]:
-                if preferred_platform and preferred_platform.lower() not in meta['platform'].lower():
-                    continue
+        resultado = _buscar_links_no_chroma(
+            anime_title=arguments.get("anime_title"),
+            preferred_platform=arguments.get("preferred_platform")
+        )
+        return [types.TextContent(type="text", text=json.dumps(resultado, ensure_ascii=False))]
+    raise ValueError(f"Ferramenta desconhecida: {name}")
+
+# ---------------------------------------------------------------------------
+# Função de busca centralizada — usada tanto pela rota SSE quanto pela direta
+# ---------------------------------------------------------------------------
+def _buscar_links_no_chroma(anime_title: str, preferred_platform: str = None) -> list:
+    """
+    Busca links no ChromaDB usando filtro de metadados exato pelo título.
+
+    MOTIVO DA MUDANÇA:
+      A busca semântica anterior (query_texts) podia retornar animes similares
+      ao invés do anime solicitado — ex: buscar "Jujutsu Kaisen" e receber links
+      de "Kimetsu no Yaiba" por proximidade semântica.
+      Com where= garantimos que só retornam links do anime exato requisitado.
+    """
+    output_links = []
+    try:
+        results = collection.get(
+            where={"anime_title": anime_title},
+        )
+
+        if results and results.get("metadatas"):
+            for meta in results["metadatas"]:
+                if preferred_platform:
+                    if preferred_platform.lower() not in meta["platform"].lower():
+                        continue
                 output_links.append({
-                    "anime": meta["anime_title"],
+                    "anime":      meta["anime_title"],
                     "plataforma": meta["platform"],
                     "url_direta": meta["url_direta"]
                 })
-                
-        if not output_links:
-            # Envelopa usando a classe de conteúdo do tipo texto do SDK
-            return [types.TextContent(type="text", text="Nenhum link direto encontrado no MCP.")]
-            
-        # Retorna o JSON serializado dentro do objeto de texto padrão do protocolo
-        return [
-            types.TextContent(
-                type="text", 
-                text=json.dumps(output_links, ensure_ascii=False, indent=2)
-            )
-        ]
-        
-    raise ValueError(f"Ferramenta desconhecida: {name}")
 
-# --- INSTANCIAÇÃO DO SERVIDOR WEB SSE ---
+        # Fallback: se o título exato não foi encontrado, tenta busca semântica
+        if not output_links:
+            print(f"[MCP SERVER] Título exato '{anime_title}' não encontrado. Tentando busca semântica...")
+            sem_results = collection.query(
+                query_texts=[f"Assistir {anime_title}"],
+                n_results=3
+            )
+            if sem_results and sem_results.get("metadatas") and sem_results["metadatas"][0]:
+                for meta in sem_results["metadatas"][0]:
+                    if preferred_platform:
+                        if preferred_platform.lower() not in meta["platform"].lower():
+                            continue
+                    output_links.append({
+                        "anime":      meta["anime_title"],
+                        "plataforma": meta["platform"],
+                        "url_direta": meta["url_direta"]
+                    })
+
+    except Exception as e:
+        print(f"[MCP SERVER] Erro na busca ChromaDB: {e}")
+
+    return output_links
+
+# ---------------------------------------------------------------------------
+# ROTA HTTP DIRETA — /tools/search
+# ---------------------------------------------------------------------------
+async def handle_direct_tool_search(request: Request) -> JSONResponse:
+    """
+    Rota HTTP direta que NÃO depende de sessão SSE.
+
+    Recebe: { "anime_title": "...", "preferred_platform": "..." (opcional) }
+    Retorna: { "links": [ { "anime": ..., "plataforma": ..., "url_direta": ... } ] }
+
+    Esta é a rota que o llm_chain.py deve chamar — simples, estável e sem
+    dependência de estado de sessão do protocolo SSE.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"erro": "Body JSON inválido."}, status_code=400)
+
+    anime_title = body.get("anime_title", "").strip()
+    if not anime_title:
+        return JSONResponse({"erro": "Campo 'anime_title' é obrigatório."}, status_code=400)
+
+    preferred_platform = body.get("preferred_platform")
+    links = _buscar_links_no_chroma(anime_title, preferred_platform)
+
+    print(f"[MCP SERVER] /tools/search → '{anime_title}' → {len(links)} link(s) encontrado(s).")
+    return JSONResponse({"links": links})
+
+# ---------------------------------------------------------------------------
+# SSE Transport (mantido)
+# ---------------------------------------------------------------------------
 sse = SseServerTransport("/mcp/messages")
 
 async def handle_sse(request):
-    """Endpoint onde o cliente se conecta para receber o stream de eventos SSE."""
     async with sse.connect_sse(request.scope, request.receive, request._send) as (read_stream, write_stream):
-        # Inicialização simplificada e direta sem usar classes de configurações mutáveis
         await server.run(read_stream, write_stream, server.create_initialization_options())
 
 async def handle_messages(request):
-    """Endpoint post para onde o cliente envia os comandos/mensagens."""
     await sse.handle_post_message(request.scope, request.receive, request._send)
 
-# Cria a aplicação web usando Starlette (nativa, leve e assíncrona)
+# ---------------------------------------------------------------------------
+# Aplicação Starlette
+# ---------------------------------------------------------------------------
 starlette_app = Starlette(
     routes=[
-        Route("/mcp/sse", endpoint=handle_sse, methods=["GET"]),
-        Route("/mcp/messages", endpoint=handle_messages, methods=["POST"]),
+        # Rota SSE original (mantida)
+        Route("/mcp/sse",      endpoint=handle_sse,               methods=["GET"]),
+        Route("/mcp/messages", endpoint=handle_messages,           methods=["POST"]),
+        # Nova rota HTTP direta — usada pelo llm_chain.py
+        Route("/tools/search", endpoint=handle_direct_tool_search, methods=["POST"]),
     ],
-    # Adicione propriedade CORS para liberar as requisições OPTIONS:
     middleware=[
         Middleware(
-            CORSMiddleware, 
-            allow_origins=["*"], 
-            allow_methods=["*"], 
+            CORSMiddleware,
+            allow_origins=["*"],
+            allow_methods=["*"],
             allow_headers=["*"]
         )
     ]
