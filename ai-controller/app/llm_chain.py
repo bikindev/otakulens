@@ -1,27 +1,30 @@
 # app/llm_chain.py
-import requests
-import json
+import re
 import asyncio
-import anyio
 import httpx
-from mcp import ClientSession
-from mcp.client.sse import sse_client
 from langchain_community.llms import Ollama
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 
 CATALOG_SERVICE_URL = "http://127.0.0.1:8001/catalog/search-semantic"
-MCP_SERVER_SSE_URL = "http://127.0.0.1:8002/mcp/sse"
-MCP_SERVER_MSG_URL = "http://127.0.0.1:8002/mcp/messages"
+MCP_DIRECT_TOOL_URL = "http://127.0.0.1:8002/tools/search"
 
-# Inicialização do LLM via Ollama
+# ---------------------------------------------------------------------------
+# LLM
+# ---------------------------------------------------------------------------
 llm = Ollama(
     base_url="http://127.0.0.1:11434",
-    model="llama3"
+    model="phi3:mini",
+    temperature=0.1,
+    num_predict=512,
 )
 
+MAX_CONTEXTO_CHARS = 800
+
+# ---------------------------------------------------------------------------
+# Catálogo
+# ---------------------------------------------------------------------------
 async def consultar_catalogo_vetorial(prompt_usuario: str, limite: int = 2) -> list:
-    """Busca animes no catálogo."""
     payload = {"prompt": prompt_usuario, "limite": limite}
     try:
         async with httpx.AsyncClient() as client:
@@ -30,138 +33,166 @@ async def consultar_catalogo_vetorial(prompt_usuario: str, limite: int = 2) -> l
                 return response.json()
             return []
     except Exception as e:
-        print(f"[CATALOG ERROR] Erro ao conectar no Catalog Service: {e}")
+        print(f"[CATALOG ERROR] {e}")
         return []
-    
-async def buscar_links_mcp_via_http_direto(titulo_anime: str) -> str:
-    """
-    Simula nativamente o protocolo Model Context Protocol (MCP) via JSON-RPC
-    enviando a requisição diretamente para o endpoint de mensagens HTTP do Starlette.
-    """
-    # Payload no formato exato que a especificação oficial do MCP / JSON-RPC espera
-    mcp_payload = {
-        "jsonrpc": "2.0",
-        "method": "tools/call",
-        "params": {
-            "name": "search_streaming_links",
-            "arguments": {
-                "anime_title": titulo_anime
-            }
-        },
-        "id": 1 # Identificador padrão da requisição RPC
-    }
 
+# ---------------------------------------------------------------------------
+# MCP — busca links via rota HTTP direta (sem SSE)
+# Retorna lista de dicts: [{"anime":..., "plataforma":..., "url_direta":...}]
+# ---------------------------------------------------------------------------
+async def buscar_links_mcp(titulo_anime: str) -> list:
+    """
+    Chama /tools/search e retorna a lista de links brutos.
+    O LLM NÃO verá essas URLs — elas são injetadas pelo Python depois da geração.
+    """
+    payload = {"anime_title": titulo_anime}
     try:
-        # Definimos um timeout confortável para a busca no ChromaDB local
         async with httpx.AsyncClient() as client:
             response = await client.post(
-                MCP_SERVER_MSG_URL, 
-                json=mcp_payload, 
+                MCP_DIRECT_TOOL_URL,
+                json=payload,
                 headers={"Content-Type": "application/json"},
-                timeout=120.0
+                timeout=15.0,
             )
-            
-            if response.status_code == 200:
-                mcp_response_json = response.json()
-                
-                # O protocolo MCP encapsula a resposta dentro de 'result' -> 'content'
-                if "result" in mcp_response_json and "content" in mcp_response_json["result"]:
-                    conteudo_texto = mcp_response_json["result"]["content"][0]["text"]
-                    
-                    if "Nenhum link direto" in conteudo_texto:
-                        return "  - Links diretos de transmissão indisponíveis no momento.\n"
-                    
-                    # Faz o parse da string de links gerada pelo seu ChromaDB
-                    links_lista = json.loads(conteudo_texto)
-                    links_texto = "Links oficiais calculados pelo MCP:\n"
-                    for item in links_lista:
-                        links_texto += f"  - Na {item['plataforma']}: {item['url_direta']}\n"
-                    return links_texto
-                    
-            return "  - Links detalhados indisponíveis no MCP.\n"
-            
+        if response.status_code == 200:
+            return response.json().get("links", [])
+        print(f"[MCP HTTP] Status inesperado: {response.status_code}")
+        return []
     except Exception as e:
-        print(f"[MCP DIRECT HTTP ERROR] Falha ao invocar ferramenta via HTTP: {e}")
-        return "  - Links temporariamente indisponíveis (Erro de Comunicação).\n"
+        print(f"[MCP HTTP ERROR] {e}")
+        return []
 
-async def pipeline_enriquecimento_mcp(animes_contexto: list) -> str:
-    """Varre em lote todos os animes sugeridos montando o contexto."""
-    contexto_formatado = ""
-    
-    for anime in animes_contexto:
+# ---------------------------------------------------------------------------
+# Pipeline de enriquecimento
+# ---------------------------------------------------------------------------
+async def pipeline_enriquecimento_mcp(animes_contexto: list):
+    """
+    Retorna:
+      - contexto_str : texto injetado no prompt (SEM URLs — só título, sinopse, plataformas)
+      - links_map    : dict { titulo -> lista de links } para injeção pós-geração
+    """
+    tarefas_mcp = [buscar_links_mcp(anime["titulo"]) for anime in animes_contexto]
+    resultados_mcp = await asyncio.gather(*tarefas_mcp)
+
+    contexto_str = ""
+    links_map = {}
+
+    for anime, links in zip(animes_contexto, resultados_mcp):
         titulo = anime["titulo"]
         plataformas = ", ".join(anime["plataformas"])
-        
-        contexto_formatado += f"\n---\n"
-        contexto_formatado += f"Título: {titulo} ({anime['ano']})\n"
-        contexto_formatado += f"Disponibilidade Geral: {plataformas}\n"
-        
-        # Faz a chamada HTTP direta para o servidor MCP sem depender de SDK instável
-        links_mcp = await buscar_links_mcp_via_http_direto(titulo)
-        contexto_formatado += links_mcp
-        
-        contexto_formatado += f"Informações e Reviews: {anime['trecho_contexto']}\n"
-        
-    return contexto_formatado
+        trecho = anime["trecho_contexto"]
+        if len(trecho) > MAX_CONTEXTO_CHARS:
+            trecho = trecho[:MAX_CONTEXTO_CHARS] + "..."
 
+        # Contexto para o LLM — sem nenhuma URL
+        contexto_str += "\n---\n"
+        contexto_str += f"Título: {titulo} ({anime['ano']})\n"
+        contexto_str += f"Plataformas disponíveis: {plataformas}\n"
+        contexto_str += f"Informações: {trecho}\n"
 
-def formatar_contexto_hibrido(animes_retornados: list) -> str:
-    """Agrega os dados síncronos do catálogo com as buscas assíncronas do MCP."""
-    contexto_formatado = ""
-    for anime in animes_retornados:
-        titulo = anime["titulo"]
-        plataformas = ", ".join(anime["plataformas"])
-        
-        contexto_formatado += f"\n---\n"
-        contexto_formatado += f"Título: {titulo} ({anime['ano']})\n"
-        contexto_formatado += f"Disponibilidade Geral: {plataformas}\n"
-        
-        # --- ACIONAMENTO DO BARRAMENTO MCP VIA REDE (Roda o loop assíncrono para o cliente HTTP) ---
-        links_mcp = asyncio.run(buscar_links_mcp_via_rede(titulo))
-        contexto_formatado += links_mcp
-        
-        contexto_formatado += f"Informações e Reviews: {anime['trecho_contexto']}\n"
-        
-    return contexto_formatado
+        # Links guardados separadamente para injeção posterior
+        links_map[titulo] = links
 
+    return contexto_str, links_map
+
+# ---------------------------------------------------------------------------
+# Injeção de links pós-geração
+# ---------------------------------------------------------------------------
+def _formatar_secao_links(links: list) -> str:
+    """Monta a seção 'Onde assistir' com os links reais do MCP."""
+    if not links:
+        return "**Onde assistir:** Links indisponíveis no momento.\n"
+    linhas = "**Onde assistir:**\n"
+    for item in links:
+        linhas += f"- Na {item['plataforma']}: {item['url_direta']}\n"
+    return linhas
+
+def injetar_links_na_resposta(texto_llm: str, links_map: dict) -> str:
+    """
+    Estratégia: remove qualquer bloco '**Onde assistir:**...' que o LLM tenha
+    gerado (com ou sem URL real) e substitui pelo conteúdo exato do MCP.
+
+    Para cada título em links_map, localiza o cabeçalho ### do anime na resposta
+    e injeta a seção de links logo após o bloco de Sinopse.
+    """
+    resultado = texto_llm
+
+    for titulo, links in links_map.items():
+        secao_links = _formatar_secao_links(links)
+
+        # Remove qualquer "**Onde assistir:**" existente (com conteúdo até o próximo ### ou fim)
+        resultado = re.sub(
+            r'\*\*Onde assistir:\*\*.*?(?=\n###|\Z)',
+            '',
+            resultado,
+            flags=re.DOTALL
+        )
+
+        # Localiza o fim do bloco **Sinopse:** deste anime e injeta os links logo depois
+        # Busca pelo padrão: **Sinopse:** [qualquer coisa] seguido de linha em branco
+        padrao_sinopse = r'(\*\*Sinopse:\*\*[^\n]*(?:\n(?!\n###|\n\*\*)[^\n]*)*)'
+        match = re.search(padrao_sinopse, resultado)
+        if match:
+            pos_fim_sinopse = match.end()
+            resultado = (
+                resultado[:pos_fim_sinopse]
+                + "\n\n"
+                + secao_links
+                + resultado[pos_fim_sinopse:]
+            )
+
+    return resultado.strip()
+
+# ---------------------------------------------------------------------------
+# Pipeline principal
+# ---------------------------------------------------------------------------
 async def gerar_recomendacao_rag(prompt_usuario: str) -> str:
-    """Pipeline Consolidado RAG + MCP 100% estável via requisições diretas."""
-    
+    """
+    Pipeline RAG + MCP com links injetados pelo Python (não pelo LLM).
+
+    Fluxo:
+      1. Busca animes no catálogo vetorial
+      2. Busca links no MCP (paralelo) — armazena em links_map, NÃO passa ao LLM
+      3. LLM gera apenas título + sinopse
+      4. Python injeta os links reais na resposta final
+    """
+
     # 1. RETRIEVAL
     animes_contexto = await consultar_catalogo_vetorial(prompt_usuario, limite=2)
     if not animes_contexto:
         return "Desculpe, estou com dificuldades para acessar meu catálogo de animes no momento."
 
-    # 2. CONTEXT ENRICHMENT (Chamadas HTTP limpas)
-    contexto_str = await pipeline_enriquecimento_mcp(animes_contexto)
+    # 2. CONTEXT ENRICHMENT
+    contexto_str, links_map = await pipeline_enriquecimento_mcp(animes_contexto)
 
-    # 3. PROMPT ENGINEERING
+    # 3. PROMPT — LLM gera apenas sinopse, sem ver URLs
     prompt_template = ChatPromptTemplate.from_messages([
         ("system", (
-            "Você é o OtakuLens, um recomendador especialista em animes que se comunica "
-            "EXCLUSIVAMENTE em Português do Brasil (pt-BR).\n\n"
-            
-            "CRITÉRIO DE TRADUÇÃO OBRIGATÓRIO:\n"
-            "Caso a pergunta seja sobre animes, utilize o contexto abaixo. O contexto pode conter textos em inglês ou espanhol. "
-            "Você deve fazer a TRADUÇÃO COMPLETA desses textos para o Português (pt-BR) antes de exibir a sinopse. "
-            "Escreva de forma natural.\n\n"
-            
-            "Para cada anime válido recomendado, monte rigorosamente esta estrutura de Markdown:\n"
-            "### [Nome do Anime]\n"
-            "**Sinopse:** [Insira aqui o resumo traduzido e adaptado em português brasileiro com base no contexto]\n"
-            "**Onde assistir:** [Insira aqui os links calculados pelo MCP para este anime]\n\n"
-            
-            "CONTEXTO DOS ANIMES E LINKS DE STREAMING (RAG + MCP):\n{contexto}"
+            "Você é o OtakuLens, recomendador especialista em animes. "
+            "Responda EXCLUSIVAMENTE em Português do Brasil (pt-BR). "
+            "Traduza qualquer texto em inglês ou espanhol.\n\n"
+
+            "Para cada anime no CONTEXTO, escreva EXATAMENTE neste formato:\n\n"
+            "### [Nome do Anime] ([Ano])\n"
+            "**Sinopse:** [Escreva aqui um resumo em português, baseado nas Informações do contexto]\n\n"
+
+            "NÃO escreva a seção 'Onde assistir'. Ela será adicionada automaticamente.\n"
+            "NÃO invente informações. Use apenas o que está no CONTEXTO.\n\n"
+
+            "CONTEXTO:\n{contexto}"
         )),
-        ("user", "{pergunta}")
+        ("user", "{pergunta}"),
     ])
 
-    # 4. EXECUÇÃO DA CHAIN
     chain = prompt_template | llm | StrOutputParser()
-    
     try:
-        resultado = await chain.ainvoke({"contexto": contexto_str, "pergunta": prompt_usuario})
-        return resultado
-    except Exception as llm_err:
-        print(f"[LLM GENERATION ERROR] Falha na resposta do Ollama: {llm_err}")
-        return "O gerador de texto local demorou muito para responder. Por favor, tente novamente."
+        texto_llm = await chain.ainvoke(
+            {"contexto": contexto_str, "pergunta": prompt_usuario}
+        )
+    except Exception as e:
+        print(f"[LLM ERROR] {e}")
+        return "O modelo local demorou muito para responder. Tente novamente."
+
+    # 4. INJEÇÃO DOS LINKS PELO PYTHON (100% confiável, sem depender do LLM)
+    resposta_final = injetar_links_na_resposta(texto_llm, links_map)
+    return resposta_final
