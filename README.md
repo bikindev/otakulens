@@ -19,7 +19,7 @@ O objetivo do sistema é consolidar uma especificação arquitetural de microsse
 O sistema foi modelado seguindo uma arquitetura de microsserviços fracamente acoplados, distribuídos em camadas lógicas para garantir escalabilidade, isolamento de falhas e independência de implantação.
 
 ### Diagrama da Arquitetura
-
+<img width="741" height="536" alt="arq-final-otakulens drawio" src="https://github.com/user-attachments/assets/a220554a-9c9e-4507-bdbd-6584d3e905d7" />
 
 ### Descrição dos Componentes
 
