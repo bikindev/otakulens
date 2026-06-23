@@ -1,3 +1,7 @@
+<img width="551" height="546" alt="616db8be-af13-4718-b0f9-29d44d380f07" src="https://github.com/user-attachments/assets/a29f0bc5-b072-421a-94af-19035fd20e28" />
+<img width="551" height="546" alt="616db8be-af13-4718-b0f9-29d44d380f07" src="https://github.com/user-attachments/assets/e20cc474-f83b-4e06-b54f-5fbe5941f709" />
+<img width="551" height="546" alt="616db8be-af13-4718-b0f9-29d44d380f07" src="https://github.com/user-attachments/assets/c923f714-03d8-484e-af1b-7c7bf8a62c45" />
+<img width="551" height="546" alt="616db8be-af13-4718-b0f9-29d44d380f07" src="https://github.com/user-attachments/assets/1cbdae67-b8ef-4185-aa3f-58b77856a2db" />
 # 🎬 OtakuLens - Recomendador Inteligente de Animes
 
 Trabalho prático final desenvolvido para a disciplina **GCC129 Sistemas Distribuídos** no curso de Sistemas de Informação da **Universidade Federal de Lavras (UFLA)**.
@@ -19,7 +23,7 @@ O objetivo do sistema é consolidar uma especificação arquitetural de microsse
 O sistema foi modelado seguindo uma arquitetura de microsserviços fracamente acoplados, distribuídos em camadas lógicas para garantir escalabilidade, isolamento de falhas e independência de implantação.
 
 ### Diagrama da Arquitetura
-<img width="741" height="536" alt="arq-final-otakulens drawio" src="https://github.com/user-attachments/assets/a220554a-9c9e-4507-bdbd-6584d3e905d7" />
+<img width="551" height="546" alt="616db8be-af13-4718-b0f9-29d44d380f07" src="https://github.com/user-attachments/assets/b27bec13-af21-424f-9871-f7c65a6452bf" />
 
 ### Descrição dos Componentes
 
